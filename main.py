@@ -1,8 +1,8 @@
 import os
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_file, current_app, session, abort
+from flask_restx import Api, Resource, fields, Namespace
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-from typing_extensions import Annotated
 from src.models import db, User, Transaction, InitialBalance, UserPreferences
 from src.forms import LoginForm, RegistrationForm, CreateUserForm
 from src.anthropic_service import FinancialAnalytics
@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 import traceback
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 import matplotlib.pyplot as plt
 import io
 import base64
@@ -55,10 +54,10 @@ from sqlalchemy.exc import SQLAlchemyError
 load_dotenv()
 
 # Ensure instance folder exists
-instance_path = os.path.join(os.path.dirname(__file__),'instance')
+instance_path = os.path.join(os.path.dirname(__file__), 'instance')
 os.makedirs(instance_path, exist_ok=True)
 
-upload_path = os.path.join(os.path.dirname(__file__), 'uploads')
+upload_path = os.path.join(os.path.dirname(__file__), 'Uploads')
 os.makedirs(upload_path, exist_ok=True)
 
 app = Flask(__name__,
@@ -66,13 +65,68 @@ app = Flask(__name__,
             static_folder='static')
 app.config.from_object(Config)
 
+# Initialize Flask-RESTX API
+api = Api(
+    app,
+    version='1.0',
+    title='FlowTrack API',
+    description='A Financial Management Application API',
+    prefix='/api/v1',
+    doc='/api/v1/docs'
+)
+
+# Define namespaces for better organization
+auth_ns = Namespace('auth', description='Authentication operations')
+transaction_ns = Namespace('transactions', description='Transaction operations')
+user_ns = Namespace('users', description='User management operations')
+ai_ns = Namespace('ai', description='AI-powered financial analysis')
+admin_ns = Namespace('admin', description='Admin operations')
+
+# Add namespaces to API
+api.add_namespace(auth_ns)
+api.add_namespace(transaction_ns)
+api.add_namespace(user_ns)
+api.add_namespace(ai_ns)
+api.add_namespace(admin_ns)
+
+# Define API models
+user_model = api.model('User', {
+    'id': fields.Integer(readonly=True, description='User ID'),
+    'username': fields.String(required=True, description='Username'),
+    'email': fields.String(description='Email address'),
+    'roles': fields.List(fields.String, description='User roles'),
+    'created_at': fields.DateTime(description='Account creation date'),
+    'last_login': fields.DateTime(description='Last login date')
+})
+
+transaction_model = api.model('Transaction', {
+    'id': fields.Integer(readonly=True, description='Transaction ID'),
+    'user_id': fields.Integer(description='User ID'),
+    'date': fields.DateTime(required=True, description='Transaction date'),
+    'description': fields.String(required=True, description='Transaction description'),
+    'amount': fields.Float(required=True, description='Transaction amount'),
+    'type': fields.String(required=True, description='Transaction type (income/expense)')
+})
+
+initial_balance_model = api.model('InitialBalance', {
+    'user_id': fields.Integer(description='User ID'),
+    'balance': fields.Float(required=True, description='Initial balance')
+})
+
+error_model = api.model('Error', {
+    'error': fields.String(description='Error message'),
+    'code': fields.Integer(description='Error code')
+})
+
+success_model = api.model('Success', {
+    'success': fields.Boolean(description='Success status'),
+    'message': fields.String(description='Success message')
+})
+
 db.init_app(app)
-
 migrate = Migrate(app, db)
-
-
 login_manager = LoginManager(app)
-login_manager.login_view = 'login'
+login_manager.login_view = 'auth.login'
 
 babel = Babel()
 
@@ -91,35 +145,22 @@ def inject_role_context():
     }
 
 def get_locale():
-    # Debug print
-    print(f"get_locale called, session: {session}")
-    
-    # First check if a language is stored in the session
     if 'language' in session:
         lang = session['language']
-        print(f"Using language from session: {lang}")
         return lang
-        
-    # Otherwise fallback to browser preference
-    browser_lang = request.accept_languages.best_match(['en', 'es', 'ja', 'ar', 'ru', 'zh'])
-    print(f"Using browser language: {browser_lang}")
-    return browser_lang
+    return request.accept_languages.best_match(['en', 'es', 'ja', 'ar', 'ru', 'zh'])
 
-# Initialize babel with the locale selector function
 babel.init_app(app, locale_selector=get_locale)
 
 @app.template_filter('datetimeformat')
 def datetimeformat(value, fmt='%Y-%m-%d %H:%M'):
-    """Jinja filter to format datetime or datetime-like strings safely."""
     try:
         if value is None or value == '':
             return ''
         if isinstance(value, str):
-            # Try ISO format first
             try:
                 dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
             except Exception:
-                # Fallback to common formats
                 for pattern in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
                     try:
                         dt = datetime.strptime(value, pattern)
@@ -137,13 +178,11 @@ def datetimeformat(value, fmt='%Y-%m-%d %H:%M'):
         return value
 
 def validate_csrf_header_if_enabled() -> bool:
-    """Validates X-CSRFToken header only when CSRF is enabled and a session token exists."""
     try:
         if not current_app.config.get('WTF_CSRF_ENABLED'):
             return True
         token_in_session = session.get('csrf_token')
         if not token_in_session:
-            # No session token to validate against; skip strict validation
             return True
         header_token = request.headers.get('X-CSRFToken') or request.headers.get('X-CSRF-Token')
         if not header_token:
@@ -152,24 +191,12 @@ def validate_csrf_header_if_enabled() -> bool:
     except Exception:
         return False
 
-@app.route('/set-language/<language>')
-def set_language(language):
-    # Store language in session
-    session['language'] = language
-    print(f"Setting language to: {language}")
-    print(f"Session contains: {session}")
-    # Debug response to confirm language setting
-    flash(f'Language set to: {language}', 'info')
-    # Redirect back to the referring page or home page
-    return redirect(request.referrer or url_for('home'))
-
 @login_manager.user_loader
 def load_user(user_id):
-    #return User.query.get(int(user_id))
     return db.session.get(User, int(user_id))
 
-#All routes in app
-@app.route('/',methods=['GET','POST'])
+# Template Routes (Maintaining Existing Functionality)
+@app.route('/', methods=['GET', 'POST'])
 @app.route('/home', methods=['GET', 'POST'])
 @login_required
 def home():
@@ -178,7 +205,6 @@ def home():
     per_page = 8
 
     if request.method == 'POST':
-        # Handle adding transactions
         new_transaction = Transaction(
             user_id=current_user.id,
             date=request.form.get('date'),
@@ -191,11 +217,9 @@ def home():
         flash('Transaction added successfully', 'success')
         return redirect(url_for('home'))
 
-    # Filter transactions by current user
     paginated_transactions = Transaction.query.filter_by(user_id=current_user.id).order_by(Transaction.date.desc()).paginate(page=page, per_page=per_page)
     all_transactions = Transaction.query.filter_by(user_id=current_user.id).all()
     
-    # Get initial balance for current user
     initial_balance_record = InitialBalance.query.filter_by(user_id=current_user.id).first()
     initial_balance = initial_balance_record.balance if initial_balance_record else 0.0
 
@@ -212,23 +236,16 @@ def login():
     form = LoginForm()
     if form.validate_on_submit():
         user = User.query.filter_by(username=form.username.data).first()
-        # Optional OTP support
-        otp_code = request.form.get('otp')
-        # If 2FA is enforced in settings in future, validate otp_code here
         if user and check_password_hash(user.password, form.password.data):
-            # Update last_login timestamp before logging in
-            try:
-                user.last_login = datetime.utcnow()
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
+            user.last_login = datetime.utcnow()
+            db.session.commit()
             login_user(user, remember=True)
             return redirect(url_for('home'))
         else:
             flash('Login Unsuccessful. Please check username and password', 'danger')
     return render_template('login.html', form=form)
 
-@app.route('/register',methods=['GET','POST'])
+@app.route('/register', methods=['GET', 'POST'])
 def register():
     if current_user.is_authenticated:
         return redirect(url_for('home'))
@@ -251,294 +268,243 @@ def register():
             db.session.add(new_user)
             db.session.commit()
             
-            # Assign default 'user' role
             success = assign_default_role(new_user)
             if not success:
                 current_app.logger.warning(f"Default role assignment failed for user {new_user.username}. Ensure roles are seeded.")
             
             new_preferences = UserPreferences(user_id=new_user.id)
             db.session.add(new_preferences)
-            db.session.flush()  # Ensure the preferences have an ID
+            db.session.flush()
             new_preferences.ensure_role_based_modules(new_user)
             db.session.commit()
             flash('Your account has been created! You can now log in.', 'success')
             return redirect(url_for('login'))
     return render_template('register.html', form=form)
 
-@app.route('/admin/users/create', methods=['GET', 'POST'])
-@super_admin_required
-def admin_create_user():
-    form = CreateUserForm()
-    if request.method == 'GET':
-        # Defaults
-        form.subscription_tier.data = current_app.config.get('DEFAULT_SUBSCRIPTION_TIER', 'free')
-        form.timezone.data = 'UTC'
-    if form.validate_on_submit():
-        from src.admin_utils import create_user_account
-        role_names = []
-        if form.roles.data:
-            role_names = [r.strip() for r in form.roles.data.split(',') if r.strip()]
-        data = {
-            'username': form.username.data,
-            'email': form.email.data,
-            'first_name': form.first_name.data,
-            'last_name': form.last_name.data,
-            'company_name': form.company_name.data,
-            'subscription_tier': form.subscription_tier.data,
-            'tenant_id': form.tenant_id.data,
-            'phone': form.phone.data,
-            'timezone': form.timezone.data,
-            'password': form.password.data or None,
-            'notes': form.notes.data,
-            'is_active': form.is_active.data,
-        }
-        user, result = create_user_account(current_user, data, role_names)
-        if user:
-            flash('User created successfully', 'success')
-            return redirect(url_for('admin_user_detail', user_id=user.id))
-        else:
-            errs = result.get('errors', {}) if isinstance(result, dict) else {}
-            for k, v in errs.items():
-                flash(f"{k}: {v}", 'danger')
-    return render_template('admin/create_user.html', form=form)
+# API Routes
+@auth_ns.route('/login')
+class Login(Resource):
+    @auth_ns.doc('login_user')
+    @auth_ns.expect(api.model('LoginRequest', {
+        'username': fields.String(required=True, description='Username'),
+        'password': fields.String(required=True, description='Password')
+    }))
+    @auth_ns.response(200, 'Success', success_model)
+    @auth_ns.response(401, 'Unauthorized', error_model)
+    def post(self):
+        data = request.get_json()
+        user = User.query.filter_by(username=data.get('username')).first()
+        if user and check_password_hash(user.password, data.get('password')):
+            user.last_login = datetime.utcnow()
+            db.session.commit()
+            login_user(user, remember=True)
+            return {'success': True, 'message': 'Login successful'}, 200
+        return {'error': 'Invalid credentials', 'code': 401}, 401
 
-@app.route('/logout')
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('login'))
+@auth_ns.route('/logout')
+class Logout(Resource):
+    @auth_ns.doc('logout_user', security='session')
+    @login_required
+    @auth_ns.response(200, 'Success', success_model)
+    def post(self):
+        logout_user()
+        return {'success': True, 'message': 'Logged out successfully'}, 200
 
-@app.route('/edit/<int:transaction_id>', methods=['GET', 'POST'])
-@transaction_owner_or_admin_required('transaction_id')
-def edit_transaction(transaction_id):
-    transaction = Transaction.query.get_or_404(transaction_id)
-    if request.method == 'POST':
-        transaction.date = request.form['date']
-        transaction.description = request.form['description']
-        transaction.amount = float(request.form['amount'])
-        transaction.type = request.form['type']
+@auth_ns.route('/register')
+class Register(Resource):
+    @auth_ns.doc('register_user')
+    @auth_ns.expect(api.model('RegisterRequest', {
+        'username': fields.String(required=True, description='Username'),
+        'email': fields.String(required=True, description='Email'),
+        'password': fields.String(required=True, description='Password')
+    }))
+    @auth_ns.response(201, 'Created', success_model)
+    @auth_ns.response(400, 'Bad Request', error_model)
+    def post(self):
+        if not current_app.config.get('PUBLIC_SIGNUP_ENABLED', True):
+            return {'error': 'Registration is disabled', 'code': 403}, 403
+        data = request.get_json()
+        if User.query.filter_by(username=data.get('username')).first():
+            return {'error': 'Username already exists', 'code': 400}, 400
+        hashed_password = generate_password_hash(data.get('password'))
+        new_user = User(
+            username=data.get('username'),
+            email=data.get('email'),
+            password=hashed_password,
+            subscription_tier=current_app.config.get('DEFAULT_SUBSCRIPTION_TIER', 'free'),
+            timezone='UTC'
+        )
+        db.session.add(new_user)
         db.session.commit()
-        flash('Transaction Updated Successfully', 'success')
-        return redirect(url_for('cash_activities'))
-    return render_template('edit_transaction.html', transaction=transaction)
+        assign_default_role(new_user)
+        new_preferences = UserPreferences(user_id=new_user.id)
+        db.session.add(new_preferences)
+        db.session.flush()
+        new_preferences.ensure_role_based_modules(new_user)
+        db.session.commit()
+        return {'success': True, 'message': 'User registered successfully'}, 201
 
-@app.route('/delete/<int:transaction_id>', methods=['POST'])
-@transaction_owner_or_admin_required('transaction_id')
-def delete_transaction(transaction_id):
-    transaction = Transaction.query.get_or_404(transaction_id)
-    db.session.delete(transaction)
-    db.session.commit()
-    flash('Your Transaction Deleted!', 'danger')
-    return redirect(url_for('home'))
+@transaction_ns.route('')
+class TransactionList(Resource):
+    @transaction_ns.doc('list_transactions', security='session')
+    @login_required
+    @transaction_ns.marshal_list_with(transaction_model)
+    def get(self):
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 8, type=int)
+        transactions = Transaction.query.filter_by(user_id=current_user.id).order_by(Transaction.date.desc()).paginate(page=page, per_page=per_page)
+        return transactions.items
 
-@app.route('/upload', methods=['GET', 'POST'])
-@login_required
-def upload_route():
-    if request.method == 'GET':
-        return render_template('upload.html')
-    elif request.method == 'POST':
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file part'}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': 'No selected file'}), 400
-        
+    @transaction_ns.doc('create_transaction', security='session')
+    @login_required
+    @transaction_ns.expect(transaction_model)
+    @transaction_ns.response(201, 'Created', success_model)
+    @transaction_ns.response(400, 'Bad Request', error_model)
+    def post(self):
+        data = request.get_json()
         try:
-            result = process_upload(file)
-            return jsonify(result)
-        except Exception as e:
-            app.logger.error(f"Error in upload_file: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-@app.route('/set-initial-balance', methods=['POST'])
-@login_required
-def set_initial_balance():
-    try:
-        amount = float(request.form.get('initial_balance'))
-        
-        # Get or create initial balance record for the user
-        initial_balance = InitialBalance.query.filter_by(user_id=current_user.id).first()
-        if initial_balance:
-            initial_balance.balance = amount
-        else:
-            initial_balance = InitialBalance(user_id=current_user.id, balance=amount)
-            db.session.add(initial_balance)
-            
-        db.session.commit()
-        flash('Initial balance set successfully', 'success')
-    except ValueError:
-        flash('Please enter a valid number for the initial balance', 'danger')
-    except Exception as e:
-        flash(f'Error setting initial balance: {str(e)}', 'danger')
-        
-    return redirect(url_for('cash_overview'))
-
-@app.route('/export/<file_type>')
-@login_required
-def export(file_type):
-    # Get accessible transactions based on user role
-    transactions_query, filename_prefix = prepare_export_data(current_user, file_type)
-    transactions = transactions_query.all()
-    
-    # Log data access for security auditing
-    log_data_access(current_user, 'transactions', 'export', f'export_{file_type}')
-    
-    data = [{
-        'Date': transaction.date,
-        'Description': transaction.description,
-        'Amount': transaction.amount,
-        'Type': transaction.type,
-        'User': transaction.user.username if hasattr(transaction, 'user') else f'User {transaction.user_id}'
-    } for transaction in transactions]
-
-    df = pd.DataFrame(data)
-
-    if file_type == 'csv':
-        output = BytesIO()
-        df.to_csv(output, index=False)
-        output.seek(0)
-        return send_file(output, mimetype='text/csv', as_attachment=True, download_name=f'{filename_prefix}.csv')
-    elif file_type == 'excel':
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Transactions')
-        output.seek(0)
-        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 
-                         as_attachment=True, download_name=f'{filename_prefix}.xlsx')
-    elif file_type == 'pdf':
-        flash('PDF export is not yet implemented.', 'warning')
-        return redirect(url_for('home'))
-    else:
-        flash('Invalid file type requested.', 'danger')
-        return redirect(url_for('home'))
-
-@app.route('/save_transactions', methods=['POST'])
-@login_required
-def save_transactions():
-    data = request.json
-    try:
-        for item in data:
             new_transaction = Transaction(
                 user_id=current_user.id,
-                date=item['date'],
-                description=item['description'],
-                amount=float(item['amount']),
-                type=item['type']
+                date=datetime.fromisoformat(data.get('date')),
+                description=data.get('description'),
+                amount=float(data.get('amount')),
+                type=data.get('type')
             )
             db.session.add(new_transaction)
-        db.session.commit()
-        return jsonify({'message': 'Transactions saved successfully'})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 500
+            db.session.commit()
+            return {'success': True, 'message': 'Transaction created'}, 201
+        except Exception as e:
+            db.session.rollback()
+            return {'error': str(e), 'code': 400}, 400
 
-@app.route('/balance-by-date', methods=['POST'])
-@login_required
-def balance_by_date():
-    try:
-        date_str = request.form.get('date')
-        target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        
-        # Get initial balance
-        initial_balance = InitialBalance.query.filter_by(user_id=current_user.id).first()
-        initial_amount = initial_balance.balance if initial_balance else 0
-        
-        # Get all transactions up to the target date
-        transactions = Transaction.query.filter(
-            Transaction.user_id == current_user.id,
-            Transaction.date <= target_date
-        ).all()
-        
-        # Calculate totals
-        total_cfo, total_cfi, total_cff = calculate_totals(transactions)
-        balance = initial_amount + total_cfo + total_cfi + total_cff
-        
-        return jsonify({
-            'success': True,
-            'balance': balance,
-            'date': date_str
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 400
-    
-@app.route('/forecast', methods=['GET'])
-@super_admin_required
-def forecast():
-    try:
-        # Get current user's transactions only
-        transactions_query = Transaction.query.filter_by(user_id=current_user.id)
-        transactions = transactions_query.order_by(Transaction.date).all()
-        
-        if not transactions:
-            return jsonify({
-                'error': 'No transactions found. Please add some transactions first.'
-            }), 400
-            
-        # Convert transactions to a format suitable for analysis
-        transaction_data = []
-        for t in transactions:
-            if isinstance(t.date, str):
-                date_str = t.date
+@transaction_ns.route('/<int:transaction_id>')
+class Transaction(Resource):
+    @transaction_ns.doc('get_transaction', security='session')
+    @login_required
+    @transaction_owner_or_admin_required('transaction_id')
+    @transaction_ns.marshal_with(transaction_model)
+    def get(self, transaction_id):
+        return Transaction.query.get_or_404(transaction_id)
+
+    @transaction_ns.doc('update_transaction', security='session')
+    @login_required
+    @transaction_owner_or_admin_required('transaction_id')
+    @transaction_ns.expect(transaction_model)
+    @transaction_ns.response(200, 'Success', success_model)
+    @transaction_ns.response(400, 'Bad Request', error_model)
+    def put(self, transaction_id):
+        transaction = Transaction.query.get_or_404(transaction_id)
+        data = request.get_json()
+        try:
+            transaction.date = datetime.fromisoformat(data.get('date'))
+            transaction.description = data.get('description')
+            transaction.amount = float(data.get('amount'))
+            transaction.type = data.get('type')
+            db.session.commit()
+            return {'success': True, 'message': 'Transaction updated'}, 200
+        except Exception as e:
+            db.session.rollback()
+            return {'error': str(e), 'code': 400}, 400
+
+    @transaction_ns.doc('delete_transaction', security='session')
+    @login_required
+    @transaction_owner_or_admin_required('transaction_id')
+    @transaction_ns.response(200, 'Success', success_model)
+    def delete(self, transaction_id):
+        transaction = Transaction.query.get_or_404(transaction_id)
+        db.session.delete(transaction)
+        db.session.commit()
+        return {'success': True, 'message': 'Transaction deleted'}, 200
+
+@transaction_ns.route('/initial-balance')
+class InitialBalanceResource(Resource):
+    @transaction_ns.doc('set_initial_balance', security='session')
+    @login_required
+    @transaction_ns.expect(initial_balance_model)
+    @transaction_ns.response(200, 'Success', success_model)
+    @transaction_ns.response(400, 'Bad Request', error_model)
+    def post(self):
+        data = request.get_json()
+        try:
+            amount = float(data.get('balance'))
+            initial_balance = InitialBalance.query.filter_by(user_id=current_user.id).first()
+            if initial_balance:
+                initial_balance.balance = amount
             else:
-                date_str = t.date.strftime('%Y-%m-%d')
-            transaction_data.append({
-                'date': date_str,
-                'amount': t.amount,
-                'type': t.type,
-                'description': t.description
-            })
-        
-        # Initialize financial analytics with API key
-        api_key = current_app.config.get('ANTHROPIC_API_KEY')
-        if not api_key:
-            return jsonify({
-                'error': 'API key not found. Please set the ANTHROPIC_API_KEY environment variable.'
-            }), 500
-            
-        analytics = FinancialAnalytics(api_key=api_key, test_connection=False)
-        
-        # Get initial balance
-        initial_balance_record = InitialBalance.query.filter_by(user_id=current_user.id).first()
-        initial_balance = initial_balance_record.balance if initial_balance_record else 0.0
-        
-        # Calculate current balance
-        current_balance = initial_balance + sum(t.amount for t in transactions)
-        
-        # Mock working capital data (you may want to replace this with actual data)
-        working_capital = {
-            'current_assets': current_balance,
-            'current_liabilities': 0,
-            'cash': current_balance
-        }
-        
-        # Get analysis results using the correct method
-        analysis_results = analytics.generate_advanced_financial_analysis(
-            initial_balance=initial_balance,
-            current_balance=current_balance,
-            transaction_history=transaction_data,
-            working_capital=working_capital
-        )
-        
-        return jsonify({
-            'success': True,
-            'ai_analysis': analysis_results.get('ai_analysis', 'No insights available'),
-            'patterns': analysis_results.get('patterns', {'seasonal_pattern': [0] * 12}),
-            'forecasts': analysis_results.get('forecasts', {'90_days': [0] * 90}),
-            'risk_metrics': analysis_results.get('risk_metrics', {
-                'liquidity_ratio': 0,
-                'cash_flow_volatility': 0,
-                'burn_rate': 0,
-                'runway_months': 0
-            })
-        })
-    except Exception as e:
-        return jsonify({
-            'error': str(e)
-        }), 500
+                initial_balance = InitialBalance(user_id=current_user.id, balance=amount)
+                db.session.add(initial_balance)
+            db.session.commit()
+            return {'success': True, 'message': 'Initial balance set'}, 200
+        except Exception as e:
+            db.session.rollback()
+            return {'error': str(e), 'code': 400}, 400
+
+@ai_ns.route('/forecast')
+class Forecast(Resource):
+    @ai_ns.doc('generate_forecast', security='session')
+    @super_admin_required
+    @ai_rate_limit('forecast')
+    @monitor_ai_performance('forecast')
+    @ai_ns.response(200, 'Success', api.model('ForecastResponse', {
+        'success': fields.Boolean,
+        'ai_analysis': fields.String,
+        'patterns': fields.Raw,
+        'forecasts': fields.Raw,
+        'risk_metrics': fields.Raw
+    }))
+    @ai_ns.response(400, 'Bad Request', error_model)
+    @ai_ns.response(500, 'Server Error', error_model)
+    def get(self):
+        try:
+            transactions_query = Transaction.query.filter_by(user_id=current_user.id)
+            transactions = transactions_query.order_by(Transaction.date).all()
+            if not transactions:
+                return {'error': 'No transactions found', 'code': 400}, 400
+
+            transaction_data = [
+                {
+                    'date': t.date.strftime('%Y-%m-%d'),
+                    'amount': t.amount,
+                    'type': t.type,
+                    'description': t.description
+                } for t in transactions
+            ]
+
+            api_key = current_app.config.get('ANTHROPIC_API_KEY')
+            if not api_key:
+                return {'error': 'API key not found', 'code': 500}, 500
+
+            analytics = FinancialAnalytics(api_key=api_key, test_connection=False)
+            initial_balance_record = InitialBalance.query.filter_by(user_id=current_user.id).first()
+            initial_balance = initial_balance_record.balance if initial_balance_record else 0.0
+            current_balance = initial_balance + sum(t.amount for t in transactions)
+            working_capital = {
+                'current_assets': current_balance,
+                'current_liabilities': 0,
+                'cash': current_balance
+            }
+
+            analysis_results = analytics.generate_advanced_financial_analysis(
+                initial_balance=initial_balance,
+                current_balance=current_balance,
+                transaction_history=transaction_data,
+                working_capital=working_capital
+            )
+
+            return {
+                'success': True,
+                'ai_analysis': analysis_results.get('ai_analysis', 'No insights available'),
+                'patterns': analysis_results.get('patterns', {'seasonal_pattern': [0] * 12}),
+                'forecasts': analysis_results.get('forecasts', {'90_days': [0] * 90}),
+                'risk_metrics': analysis_results.get('risk_metrics', {
+                    'liquidity_ratio': 0,
+                    'cash_flow_volatility': 0,
+                    'burn_rate': 0,
+                    'runway_months': 0
+                })
+            }, 200
+        except Exception as e:
+            return {'error': str(e), 'code': 500}, 500
 
 @app.route('/generate_cashflow_statement', methods=['GET'])
 @login_required
